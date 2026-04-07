@@ -1,5 +1,5 @@
 # =============================================================================
-# GoToMock — Multi-stage Dockerfile
+# MockMentorBiz — Multi-stage Dockerfile
 # Stages:
 #   deps-backend   – pip install (cached separately from code)
 #   backend        – runtime image served by uvicorn
@@ -11,36 +11,41 @@
 # -----------------------------------------------------------------------------
 # Stage 1: Install Python dependencies (cache-friendly)
 # -----------------------------------------------------------------------------
-FROM python:3.12-slim AS deps-backend
+FROM python:3.12-slim-bookworm AS deps-backend
 
 WORKDIR /install
 
 # System libs needed by opencv-python-headless, Pillow, lxml, cryptography
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Using bookworm (stable) to avoid trixie (testing) repository issues
+RUN apt-get clean && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
         gcc \
+        g++ \
         libglib2.0-0 \
-        libgl1 \
-    && rm -rf /var/lib/apt/lists/*
+        libgl1 && \
+    rm -rf /var/lib/apt/lists/*
 
 COPY backend/requirements.txt .
 
-# Replace opencv-python with headless variant (no GUI/X11 needed in container)
-# Note: requirements.txt already references opencv-python-headless directly.
+# Install Python packages
 RUN pip install --no-cache-dir --prefix=/install/pkg -r requirements.txt
 
 # -----------------------------------------------------------------------------
 # Stage 2: Backend runtime
 # -----------------------------------------------------------------------------
-FROM python:3.12-slim AS backend
+FROM python:3.12-slim-bookworm AS backend
 
 WORKDIR /app
 
 # Runtime libs only (no gcc)
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get clean && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
         libglib2.0-0 \
         libgl1 \
-        curl \
-    && rm -rf /var/lib/apt/lists/*
+        curl && \
+    rm -rf /var/lib/apt/lists/*
 
 # Copy installed packages from deps stage
 COPY --from=deps-backend /install/pkg /usr/local
@@ -70,7 +75,7 @@ FROM node:20-alpine AS deps-frontend
 WORKDIR /app
 
 COPY frontend/package.json frontend/package-lock.json ./
-RUN npm ci --legacy-peer-deps
+RUN npm install --legacy-peer-deps
 
 # -----------------------------------------------------------------------------
 # Stage 4: Build the Vite/React frontend
@@ -80,7 +85,7 @@ FROM node:20-alpine AS frontend-build
 # Build-time env vars injected by docker-compose (VITE_* are baked into the bundle)
 ARG VITE_API_BASE_URL=""
 ARG VITE_WS_BASE_URL=""
-ARG VITE_APP_NAME="GoToMock"
+ARG VITE_APP_NAME="MockMentorBiz"
 ARG VITE_APP_VERSION="1.0.0"
 ARG VITE_ENABLE_VOICE_RECORDING="true"
 ARG VITE_ENABLE_VIDEO_PROCTORING="true"

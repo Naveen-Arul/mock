@@ -62,13 +62,27 @@ const PerformancePage = () => {
   const [selectedTimeframe, setSelectedTimeframe] = useState('all')
   const [audioUrls, setAudioUrls] = useState<Record<string, string>>({})
 
-  const completedInterview = (location.state as any)?.completedInterview as Partial<InterviewResult> | undefined
-  const showSingleInterview = Boolean(completedInterview)
+  const routeState = (location.state as any) || {}
+  const completedInterview = routeState.completedInterview as Partial<InterviewResult> | undefined
+  const routedInterviewId = routeState.interviewId as number | string | undefined
 
   const { data: performanceData, isLoading, isError } = useQuery({
     queryKey: ['student-performance', selectedTimeframe],
     queryFn: () => studentApi.getPerformance(selectedTimeframe),
+    enabled: !routedInterviewId,
   })
+
+  const {
+    data: singleInterviewData,
+    isLoading: isSingleLoading,
+    isError: isSingleError,
+  } = useQuery({
+    queryKey: ['student-interview-result', routedInterviewId],
+    queryFn: () => studentApi.getInterviewResults(String(routedInterviewId)),
+    enabled: Boolean(routedInterviewId),
+  })
+
+  const showSingleInterview = Boolean(completedInterview || singleInterviewData?.data)
 
   const results = performanceData?.data?.interviews || []
   const stats = performanceData?.data?.stats || {}
@@ -97,25 +111,66 @@ const PerformancePage = () => {
     setAudioUrls((prev) => ({ ...prev, [key]: url }))
   }
 
+  const singleInterviewFromApi: InterviewResult | null = singleInterviewData?.data
+    ? {
+        id: String(singleInterviewData.data.interview_id ?? routedInterviewId ?? 'interview'),
+        interview_type: String(singleInterviewData.data.interview_type ?? 'unknown'),
+        completed_at: String(
+          singleInterviewData.data.ended_at ??
+            singleInterviewData.data.started_at ??
+            new Date().toISOString()
+        ),
+        duration_minutes: Number(singleInterviewData.data.duration_minutes ?? 0),
+        overall_score: Number(singleInterviewData.data.overall_score ?? 0),
+        technical_score: Number(singleInterviewData.data.technical_score ?? 0),
+        communication_score: Number(singleInterviewData.data.communication_score ?? 0),
+        confidence_score: Number(singleInterviewData.data.confidence_score ?? 0),
+        feedback: String(singleInterviewData.data.evaluation?.feedback ?? ''),
+        strengths: Array.isArray(singleInterviewData.data.strengths)
+          ? singleInterviewData.data.strengths
+          : [],
+        areas_for_improvement: Array.isArray(singleInterviewData.data.areas_for_improvement)
+          ? singleInterviewData.data.areas_for_improvement
+          : [],
+        recommendations: Array.isArray(singleInterviewData.data.evaluation?.recommendations)
+          ? singleInterviewData.data.evaluation.recommendations
+          : [],
+        malpractice_count: Number(singleInterviewData.data.malpractice_count ?? 0),
+        malpractice_breakdown:
+          singleInterviewData.data.malpractice_breakdown &&
+          typeof singleInterviewData.data.malpractice_breakdown === 'object'
+            ? singleInterviewData.data.malpractice_breakdown
+            : {},
+        per_question: Array.isArray(singleInterviewData.data.per_question)
+          ? singleInterviewData.data.per_question
+          : [],
+      }
+    : null
+
   const displayResults: InterviewResult[] = showSingleInterview
     ? [
-        {
-          ...(completedInterview as any),
-          id: String((completedInterview as any)?.id ?? (completedInterview as any)?.interview_id ?? 'completed'),
-          interview_type: String((completedInterview as any)?.interview_type ?? 'unknown'),
-          completed_at: String((completedInterview as any)?.completed_at ?? new Date().toISOString()),
-          duration_minutes: Number((completedInterview as any)?.duration_minutes ?? 0),
-          overall_score: Number((completedInterview as any)?.overall_score ?? 0),
-          technical_score: Number((completedInterview as any)?.technical_score ?? 0),
-          communication_score: Number((completedInterview as any)?.communication_score ?? 0),
-          confidence_score: Number((completedInterview as any)?.confidence_score ?? 0),
-          feedback: String((completedInterview as any)?.feedback ?? ''),
-          strengths: Array.isArray((completedInterview as any)?.strengths) ? ((completedInterview as any)?.strengths as any) : [],
-          areas_for_improvement: Array.isArray((completedInterview as any)?.areas_for_improvement)
-            ? ((completedInterview as any)?.areas_for_improvement as any)
-            : [],
-          recommendations: Array.isArray((completedInterview as any)?.recommendations) ? ((completedInterview as any)?.recommendations as any) : [],
-        } as InterviewResult,
+        (singleInterviewFromApi ??
+          ({
+            ...(completedInterview as any),
+            id: String((completedInterview as any)?.id ?? (completedInterview as any)?.interview_id ?? 'completed'),
+            interview_type: String((completedInterview as any)?.interview_type ?? 'unknown'),
+            completed_at: String((completedInterview as any)?.completed_at ?? new Date().toISOString()),
+            duration_minutes: Number((completedInterview as any)?.duration_minutes ?? 0),
+            overall_score: Number((completedInterview as any)?.overall_score ?? 0),
+            technical_score: Number((completedInterview as any)?.technical_score ?? 0),
+            communication_score: Number((completedInterview as any)?.communication_score ?? 0),
+            confidence_score: Number((completedInterview as any)?.confidence_score ?? 0),
+            feedback: String((completedInterview as any)?.feedback ?? ''),
+            strengths: Array.isArray((completedInterview as any)?.strengths)
+              ? ((completedInterview as any)?.strengths as any)
+              : [],
+            areas_for_improvement: Array.isArray((completedInterview as any)?.areas_for_improvement)
+              ? ((completedInterview as any)?.areas_for_improvement as any)
+              : [],
+            recommendations: Array.isArray((completedInterview as any)?.recommendations)
+              ? ((completedInterview as any)?.recommendations as any)
+              : [],
+          } as InterviewResult)),
       ]
     : results
 
@@ -417,7 +472,7 @@ const PerformancePage = () => {
     pdf.save(`interview-result-${Date.now()}.pdf`)
   }
 
-  if (isLoading) {
+  if (isLoading || isSingleLoading) {
     return (
       <div className="min-h-screen bg-gray-50 flex items-center justify-center">
         <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary-600"></div>
@@ -425,7 +480,7 @@ const PerformancePage = () => {
     )
   }
 
-  if (isError) {
+  if (isError || isSingleError) {
     return (
       <div className="min-h-screen bg-gray-50 flex items-center justify-center">
         <div className="text-center">
@@ -664,7 +719,7 @@ const PerformancePage = () => {
                     <span className="text-sm font-medium bg-gray-100 text-gray-800 px-2 py-1 rounded">
                       {type.replace(/_/g, ' ').toUpperCase()}
                     </span>
-                    <span className={`text-lg font-bold px-2 py-0.5 rounded-full text-sm ${
+                    <span className={`font-bold px-2 py-0.5 rounded-full text-sm ${
                       data.avg_score >= 80 ? 'text-green-600 bg-green-100' :
                       data.avg_score >= 60 ? 'text-yellow-600 bg-yellow-100' :
                       'text-red-600 bg-red-100'

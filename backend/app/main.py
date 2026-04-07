@@ -25,6 +25,7 @@ from app.api.super_admin import super_admin_router
 from app.api.owner import owner_router
 from app.api.interviews import interview_router
 from app.api.tts import tts_router
+from app.api.realtime import realtime_router
 from app.utils.auth import verify_token
 
 # Load environment variables
@@ -97,6 +98,7 @@ app.include_router(super_admin_router, prefix="/api/super-admin", tags=["Super A
 app.include_router(owner_router, prefix="/api/owner", tags=["Owner"])
 app.include_router(interview_router, prefix="/api/interviews", tags=["Interviews"])
 app.include_router(tts_router, prefix="/api/tts", tags=["TTS"])
+app.include_router(realtime_router, prefix="/api", tags=["Realtime"])
 
 
 @app.get("/")

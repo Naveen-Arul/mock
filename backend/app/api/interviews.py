@@ -21,6 +21,8 @@ from app.models import (
 from app.utils.ai_services import VoiceProcessor
 from app.utils.deps import require_role
 from app.utils.uploads import audio_upload_dir, ensure_dir
+from app.realtime import realtime_manager
+from app.models import User
 
 interview_router = APIRouter()
 
@@ -44,6 +46,24 @@ class MalpracticeDetectionResponse(BaseModel):
     detected_issues: List[Dict]
     risk_level: str
     recommendations: List[str]
+
+
+SEVERITY_WEIGHTS = {
+    "low": 1,
+    "medium": 3,
+    "high": 5,
+    "critical": 10,
+}
+
+
+def calculate_security_rating(severities: List[str]) -> tuple[str, int]:
+    """Calculate weighted score and a human-readable security rating."""
+    score = sum(SEVERITY_WEIGHTS.get((s or "").lower(), 1) for s in severities)
+    if score >= 15:
+        return "High Risk", score
+    if score >= 5:
+        return "Suspicious", score
+    return "Normal", score
 
 
 @interview_router.post("/proctor/update")
@@ -149,15 +169,20 @@ async def update_proctoring_data(
                 "prohibited_key",
                 "devtools",
                 "devtools_open",
+                "extension_detected",
             }:
                 mapped = MalpracticeType.PROHIBITED_KEYS
                 severity = "medium"
                 combo = evt_meta.get("combo")
-                description = (
-                    "Prohibited keys detected"
-                    if not combo
-                    else f"Prohibited keys detected: {combo}"
-                )
+                if evt_type == "extension_detected":
+                    severity = "high"
+                    description = "Suspicious browser tooling/automation detected"
+                else:
+                    description = (
+                        "Prohibited keys detected"
+                        if not combo
+                        else f"Prohibited keys detected: {combo}"
+                    )
             elif evt_type in {"window_blur", "focus_lost", "window_focus_lost"}:
                 mapped = MalpracticeType.WINDOW_BLUR
                 severity = "medium"
@@ -171,14 +196,27 @@ async def update_proctoring_data(
                     if not direction
                     else f"Look away detected: {direction}"
                 )
-            elif evt_type in {"multiple_persons", "multiple_people"}:
-                mapped = MalpracticeType.MULTIPLE_PERSONS
+            elif evt_type in {"multiple_faces", "multiple_face", "multiple_persons", "multiple_people"}:
+                mapped = (
+                    MalpracticeType.MULTIPLE_FACES
+                    if evt_type in {"multiple_faces", "multiple_face"}
+                    else MalpracticeType.MULTIPLE_PERSONS
+                )
                 severity = "high"
-                count = evt_meta.get("person_count")
+                count = evt_meta.get("face_count") or evt_meta.get("person_count")
                 description = (
-                    "Multiple persons detected"
+                    "Multiple faces detected"
                     if not count
-                    else f"Multiple persons detected: {count}"
+                    else f"Multiple faces detected: {count}"
+                )
+            elif evt_type in {"no_face_detected", "no_face", "face_missing"}:
+                mapped = MalpracticeType.NO_FACE_DETECTED
+                severity = "high"
+                count = evt_meta.get("face_count")
+                description = (
+                    "No face detected"
+                    if count is None
+                    else f"No face detected: {count}"
                 )
             elif evt_type in {"phone_detected", "mobile_phone_detected"}:
                 mapped = MalpracticeType.PHONE_DETECTED
@@ -265,6 +303,26 @@ async def update_proctoring_data(
 
     db.commit()
 
+    if detected_issues:
+        student = db.query(User).filter(User.id == interview.student_id).first()
+        try:
+            await realtime_manager.broadcast_malpractice_update(
+                {
+                    "interview_id": interview.id,
+                    "student_id": interview.student_id,
+                    "new_incidents": len(detected_issues),
+                    "risk_level": "high"
+                    if any(issue["severity"] == "high" for issue in detected_issues)
+                    else "medium"
+                    if any(issue["severity"] == "medium" for issue in detected_issues)
+                    else "low",
+                },
+                college_name=student.college_name if student else None,
+            )
+        except Exception:
+            # Never fail proctoring flow due to realtime transport issues.
+            pass
+
     # Determine risk level
     risk_level = "low"
     if any(issue["severity"] == "high" for issue in detected_issues):
@@ -343,6 +401,8 @@ async def get_malpractice_summary(
         "by_severity": {"low": 0, "medium": 0, "high": 0},
         "timeline": [],
         "risk_assessment": "low",
+        "weighted_risk_score": 0,
+        "security_rating": "Normal",
     }
 
     for record in malpractice_records:
@@ -364,11 +424,15 @@ async def get_malpractice_summary(
         )
 
     # Determine overall risk
-    if summary["by_severity"]["high"] > 0:
+    rating, weighted_score = calculate_security_rating(
+        [record.severity for record in malpractice_records]
+    )
+    summary["weighted_risk_score"] = weighted_score
+    summary["security_rating"] = rating
+
+    if rating == "High Risk":
         summary["risk_assessment"] = "high"
-    elif summary["by_severity"]["medium"] > 2:
-        summary["risk_assessment"] = "high"
-    elif summary["by_severity"]["medium"] > 0:
+    elif rating == "Suspicious":
         summary["risk_assessment"] = "medium"
 
     return summary

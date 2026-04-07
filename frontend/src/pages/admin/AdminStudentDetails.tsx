@@ -1,19 +1,33 @@
-import { useQuery } from '@tanstack/react-query'
+import { useEffect } from 'react'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowLeft, BarChart3, Calendar, FileText, User } from 'lucide-react'
 import { Link, useParams } from 'react-router-dom'
 import Footer from '../../components/Footer'
 import { adminApi } from '../../utils/api'
+import { subscribeMalpracticeUpdates } from '../../utils/realtime'
 
 const AdminStudentDetails = () => {
   const { studentId } = useParams()
 
   const sid = Number(studentId)
   const isValid = Number.isFinite(sid) && sid > 0
+  const queryClient = useQueryClient()
+
+  useEffect(() => {
+    const unsubscribe = subscribeMalpracticeUpdates(() => {
+      queryClient.invalidateQueries({ queryKey: ['admin-student-performance', sid] })
+      queryClient.invalidateQueries({ queryKey: ['admin-malpractice'] })
+      queryClient.invalidateQueries({ queryKey: ['admin-malpractice-reports'] })
+    })
+
+    return unsubscribe
+  }, [queryClient, sid])
 
   const { data, isLoading, error } = useQuery({
     queryKey: ['admin-student-performance', sid],
     queryFn: () => adminApi.getStudentPerformance(sid),
     enabled: isValid,
+    refetchInterval: 10000,
   })
 
   const payload = data?.data
@@ -106,6 +120,14 @@ const AdminStudentDetails = () => {
                   <div className="text-sm text-gray-500">Avg communication</div>
                   <div className="text-xl font-semibold text-gray-900">{payload?.performance_summary?.average_communication_score ?? 0}</div>
                 </div>
+                <div className="p-4 bg-gray-50 rounded-lg">
+                  <div className="text-sm text-gray-500">Malpractice incidents</div>
+                  <div className="text-xl font-semibold text-gray-900">{payload?.performance_summary?.total_malpractice_incidents ?? 0}</div>
+                </div>
+                <div className="p-4 bg-gray-50 rounded-lg">
+                  <div className="text-sm text-gray-500">Flagged interviews</div>
+                  <div className="text-xl font-semibold text-gray-900">{payload?.performance_summary?.interviews_flagged ?? 0}</div>
+                </div>
               </div>
             </div>
 
@@ -116,16 +138,21 @@ const AdminStudentDetails = () => {
               ) : (
                 <div className="space-y-3">
                   {(payload?.recent_interviews || []).map((it: any) => (
-                    <div key={it.interview_id} className="flex items-center justify-between p-3 bg-gray-50 rounded-lg">
+                    <div key={it.interview_id || it.id} className="flex items-center justify-between p-3 bg-gray-50 rounded-lg">
                       <div className="flex items-center">
                         <FileText className="h-4 w-4 text-gray-500 mr-2" />
                         <div>
-                          <div className="text-sm font-medium text-gray-900">Interview #{it.interview_id}</div>
+                          <div className="text-sm font-medium text-gray-900">Interview #{it.interview_id || it.id}</div>
                           <div className="text-xs text-gray-500">{it.status} • {it.interview_type}</div>
+                          <div className="text-xs mt-1">
+                            <span className={(it.malpractice_count || 0) > 0 ? 'text-red-600' : 'text-green-600'}>
+                              Malpractice: {it.malpractice_count || 0}
+                            </span>
+                          </div>
                         </div>
                       </div>
                       <Link
-                        to={`/admin/interview/${it.interview_id}/results`}
+                        to={`/admin/interview/${it.interview_id || it.id}/results`}
                         className="text-primary-600 hover:text-primary-700 text-sm"
                       >
                         View results

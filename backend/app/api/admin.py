@@ -27,6 +27,7 @@ from app.utils.deps import require_role
 from app.utils.time import utc_now, to_utc
 from app.utils.ai_services import QuestionGenerator
 from app.utils.uploads import audio_upload_dir
+from app.realtime import realtime_manager
 
 admin_router = APIRouter()
 
@@ -402,6 +403,8 @@ class MalpracticeResponse(BaseModel):
     overall_score: Optional[float]
     total_violations: int
     overall_severity: str  # highest severity across all violations
+    security_rating: str  # Normal, Suspicious, High Risk
+    weighted_risk_score: int
     violation_breakdown: List[ViolationBreakdownItem]
     first_detected_at: str
     status: str = "pending"
@@ -750,12 +753,32 @@ async def get_student_detailed_performance(
 
     # Add richer per-interview result objects so admins can view the same evaluation students see.
     enriched_recent = []
+    total_malpractice_incidents = 0
+    interviews_flagged = 0
     for interview in interviews[:10]:
         record = (
             db.query(PerformanceRecord)
             .filter(PerformanceRecord.interview_id == interview.id)
             .first()
         )
+        malpractice_rows = (
+            db.query(MalpracticeRecord)
+            .filter(MalpracticeRecord.interview_id == interview.id)
+            .all()
+        )
+        malpractice_count = len(malpractice_rows)
+        malpractice_breakdown = {}
+        for mr in malpractice_rows:
+            key = (
+                mr.malpractice_type.value
+                if getattr(mr, "malpractice_type", None)
+                else "unknown"
+            )
+            malpractice_breakdown[key] = malpractice_breakdown.get(key, 0) + 1
+        total_malpractice_incidents += malpractice_count
+        if malpractice_count > 0:
+            interviews_flagged += 1
+
         strengths = record.strengths if record else []
         weaknesses = record.weaknesses if record else []
         recommendations = []
@@ -792,6 +815,8 @@ async def get_student_detailed_performance(
                 "completed_at": interview.ended_at.isoformat()
                 if interview.ended_at
                 else None,
+                "malpractice_count": malpractice_count,
+                "malpractice_breakdown": malpractice_breakdown,
                 "feedback": feedback_text,
                 "strengths": strengths or [],
                 "areas_for_improvement": weaknesses or [],
@@ -811,6 +836,8 @@ async def get_student_detailed_performance(
             "completed_interviews": len(
                 [i for i in interviews if i.status == InterviewStatus.COMPLETED]
             ),
+            "total_malpractice_incidents": total_malpractice_incidents,
+            "interviews_flagged": interviews_flagged,
             "average_technical_score": round(stats.avg_technical or 0, 2),
             "average_communication_score": round(stats.avg_communication or 0, 2),
             "average_confidence_score": round(stats.avg_confidence or 0, 2),
@@ -944,6 +971,14 @@ async def get_malpractice_reports(
         g["records"].append(malpractice)
 
     SEVERITY_ORDER = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+    SEVERITY_WEIGHTS = {"low": 1, "medium": 3, "high": 5, "critical": 10}
+
+    def _get_security_rating(score: int) -> str:
+        if score >= 15:
+            return "High Risk"
+        if score >= 5:
+            return "Suspicious"
+        return "Normal"
 
     reports = []
     for interview_id, g in grouped.items():
@@ -978,6 +1013,10 @@ async def get_malpractice_reports(
         overall_severity = max(
             severities, key=lambda s: SEVERITY_ORDER.get(s, 0), default="low"
         )
+        weighted_risk_score = sum(
+            SEVERITY_WEIGHTS.get((s or "").lower(), 1) for s in severities
+        )
+        security_rating = _get_security_rating(weighted_risk_score)
 
         # Status / actions from the most-recently-reviewed record
         status_val = "pending"
@@ -1010,6 +1049,8 @@ async def get_malpractice_reports(
                 else None,
                 "total_violations": len(records),
                 "overall_severity": overall_severity,
+                "security_rating": security_rating,
+                "weighted_risk_score": weighted_risk_score,
                 "violation_breakdown": violation_breakdown,
                 "first_detected_at": first_detected.isoformat(),
                 "status": status_val,
@@ -1120,6 +1161,20 @@ async def review_malpractice_report(
         record.evidence_data = current_data
 
     db.commit()
+
+    try:
+        await realtime_manager.broadcast_malpractice_update(
+            {
+                "interview_id": report_id,
+                "review_action": action,
+                "status": new_status,
+                "reviewed_by": current_user["user_id"],
+            },
+            college_name=current_user.get("college_name"),
+        )
+    except Exception:
+        # Review updates should succeed even if realtime push fails.
+        pass
 
     return {"message": "Report reviewed successfully", "status": new_status}
 

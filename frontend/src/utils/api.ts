@@ -220,6 +220,9 @@ export const studentApi = {
 
   getPerformance: (timeframe: string = 'all') =>
     api.get('/students/performance', { params: { timeframe } }),
+
+  getInterviewResults: (interviewId: number | string) =>
+    api.get(`/students/interview/${interviewId}/results`),
   
   getDomains: () =>
     api.get('/students/domains'),

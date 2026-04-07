@@ -82,9 +82,7 @@ services:
   # Vite frontend dev server (hot reload)
   # ---------------------------------------------------------------------------
   frontend:
-    build:
-      context: .
-      target: deps-frontend
+    image: node:20-alpine
     container_name: mockmentorbiz-frontend
     restart: unless-stopped
     env_file:
@@ -105,7 +103,7 @@ services:
     networks:
       - mockmentorbiz-network
     working_dir: /app
-    command: npx vite --host 0.0.0.0 --port 5173
+    command: sh -c "npm install --legacy-peer-deps && npx vite --host 0.0.0.0 --port 5173"
 
 volumes:
   mysql_data:

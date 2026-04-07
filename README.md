@@ -27,7 +27,7 @@ A comprehensive mock interview platform designed specifically for college studen
 ## 🛠 Tech Stack
 
 - **Frontend:** React 18 + TypeScript + Vite
-- **Backend:** FastAPI + Python 3.11
+- **Backend:** FastAPI + Python 3.12
 - **Database:** MySQL 8.0
 - **AI/ML:** 
   - OpenAI Whisper (Voice Recognition)
@@ -36,10 +36,53 @@ A comprehensive mock interview platform designed specifically for college studen
 - **Real-time:** WebSockets
 - **Proctoring:** WebRTC + Computer Vision
 
+## 🐳 Docker Quick Start
+
+**Prerequisites**: Docker Desktop installed and running
+
+### Option 1: Automated Setup (Recommended)
+
+```powershell
+# Development mode (hot-reload enabled)
+.\docker-quickstart.ps1 dev
+
+# Production mode (nginx, optimized)
+.\docker-quickstart.ps1 prod
+
+# Clean all data
+.\docker-quickstart.ps1 clean
+```
+
+### Option 2: Manual Docker Compose
+
+```powershell
+# Development
+docker compose up --build
+
+# Production
+docker compose -f docker-compose.prod.yml up --build -d
+
+# Stop
+docker compose down
+```
+
+### Access After Startup
+
+- **Development**: http://localhost:5173
+- **Production**: http://localhost
+- **API Docs**: http://localhost:8000/docs
+
+### Default Login
+
+- Email: `owner@platform.com`
+- Password: `Owner@123456`
+
+📖 **Full Docker Guide**: See [DOCKER_DEPLOYMENT.md](DOCKER_DEPLOYMENT.md) for detailed instructions.
+
 ## 📁 Project Structure
 
 ```
-gotomock/
+mockmentorbiz/
 ├── frontend/           # React TypeScript app
 │   ├── src/
 │   │   ├── components/

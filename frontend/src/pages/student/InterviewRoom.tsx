@@ -17,6 +17,7 @@ import Webcam from 'react-webcam'
 import { useAudioRecorder } from 'react-audio-voice-recorder'
 import { studentApi, interviewApi, ttsApi, getApiErrorMessage } from '../../utils/api'
 import { detectPeopleAndPhonesFromElement } from '../../utils/proctorDetector'
+import type { DetectionBox } from '../../utils/proctorDetector'
 import { detectLookAwayFromElement } from '../../utils/lookAwayDetector'
 
 type ProctorEvent = {
@@ -40,6 +41,13 @@ const InterviewRoom = () => {
   const [cameraEnabled, setCameraEnabled] = useState(false)
   const [responseStartTime, setResponseStartTime] = useState<number>(0)
   const [isProctoringActive, setIsProctoringActive] = useState(false)
+  const [isFullscreenActive, setIsFullscreenActive] = useState(false)
+  const [cameraReady, setCameraReady] = useState(false)
+  const [micReady, setMicReady] = useState(false)
+  const [modelWarmedUp, setModelWarmedUp] = useState(false)
+  const [isPreflightChecking, setIsPreflightChecking] = useState(false)
+  const [preflightError, setPreflightError] = useState<string | null>(null)
+  const [preflightAttempt, setPreflightAttempt] = useState(0)
 
   // FollowUpAgent: show a "thinking" indicator while the agent generates the next question
   const [isAgentThinking, setIsAgentThinking] = useState(false)
@@ -71,8 +79,16 @@ const InterviewRoom = () => {
   const [lookAwayCount, setLookAwayCount] = useState(0)
   const [multiplePeopleCount, setMultiplePeopleCount] = useState(0)
   const [mobilePhoneCount, setMobilePhoneCount] = useState(0)
+  const [liveDetectionBoxes, setLiveDetectionBoxes] = useState<DetectionBox[]>([])
+  const [liveFrameSize, setLiveFrameSize] = useState<{ width: number; height: number }>({ width: 480, height: 270 })
+  const [liveDetectionCounts, setLiveDetectionCounts] = useState<{ faces: number; people: number; phones: number }>({
+    faces: 0,
+    people: 0,
+    phones: 0,
+  })
   const proctorEventsRef = useRef<ProctorEvent[]>([])
   const lastFullscreenStateRef = useRef<boolean>(false)
+  const fullscreenRetryRef = useRef<number>(0)
   const proctoringAutoStartRef = useRef<boolean>(false)
   const fullscreenNudgeShownRef = useRef<boolean>(false)
   const detectionInFlightRef = useRef<boolean>(false)
@@ -82,13 +98,23 @@ const InterviewRoom = () => {
   const lastMultiplePeopleEventAtRef = useRef<number>(0)
   const lastPhoneEventAtRef = useRef<number>(0)
   const clientTickInFlightRef = useRef<boolean>(false)
+  const tabHiddenSinceRef = useRef<number>(0)
+  const windowBlurSinceRef = useRef<number>(0)
+  const lastTabSwitchEventAtRef = useRef<number>(0)
+  const lastWindowBlurEventAtRef = useRef<number>(0)
+  const lastExtensionEventAtRef = useRef<number>(0)
 
   // Prohibited keys / devtools detection throttling
   const lastProhibitedKeyAtRef = useRef<number>(0)
 
+  const shouldEnforceProctoring = () => Boolean(isProctoringActive)
+
   // Background audio level monitoring (best-effort)
   const audioLevelRef = useRef<number | null>(null)
   const audioMonitorRef = useRef<{ stop: () => void } | null>(null)
+  const micReadyRef = useRef(false)
+
+  const sleep = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms))
   
   // Audio recording
   const {
@@ -187,29 +213,54 @@ const InterviewRoom = () => {
     }
   }, [interviewData])
 
-  // Tab visibility change detection
+  // Focus tracking with grace period to reduce accidental false positives.
   useEffect(() => {
+    if (!interviewData?.data?.is_proctored) return
+
+    const TAB_SWITCH_GRACE_MS = 1200
+    const TAB_SWITCH_COOLDOWN_MS = 4000
+
     const handleVisibilityChange = () => {
       if (document.hidden) {
-        setTabSwitchCount(prev => prev + 1)
-        proctorEventsRef.current = [
-          ...proctorEventsRef.current,
-          { type: 'tab_switch', timestamp: new Date() },
-        ].slice(-50)
-        toast.error('Tab switching detected - stay focused on the interview')
+        tabHiddenSinceRef.current = Date.now()
+        return
       }
+
+      const hiddenSince = tabHiddenSinceRef.current
+      tabHiddenSinceRef.current = 0
+      if (!hiddenSince) return
+
+      const now = Date.now()
+      const hiddenMs = now - hiddenSince
+      if (hiddenMs < TAB_SWITCH_GRACE_MS) return
+      if (now - lastTabSwitchEventAtRef.current < TAB_SWITCH_COOLDOWN_MS) return
+
+      lastTabSwitchEventAtRef.current = now
+      setTabSwitchCount(prev => prev + 1)
+      proctorEventsRef.current = [
+        ...proctorEventsRef.current,
+        {
+          type: 'tab_switch',
+          timestamp: new Date(),
+          metadata: { hidden_ms: hiddenMs },
+        },
+      ].slice(-50)
+      toast.error('Tab switching detected - stay focused on the interview')
     }
 
     document.addEventListener('visibilitychange', handleVisibilityChange)
     return () => document.removeEventListener('visibilitychange', handleVisibilityChange)
-  }, [])
+  }, [interviewData?.data?.is_proctored])
 
   // Fullscreen enforcement + anti-copy / anti-right-click (proctored only)
   useEffect(() => {
     if (!interviewData?.data?.is_proctored) return
 
+    setIsFullscreenActive(Boolean(document.fullscreenElement))
+
     const onFullscreenChange = () => {
       const isFs = Boolean(document.fullscreenElement)
+      setIsFullscreenActive(isFs)
       const wasFs = lastFullscreenStateRef.current
       lastFullscreenStateRef.current = isFs
 
@@ -225,6 +276,7 @@ const InterviewRoom = () => {
         document.documentElement.requestFullscreen().then(
           () => {
             lastFullscreenStateRef.current = true
+            fullscreenRetryRef.current = 0
           },
           () => {
             // ignore
@@ -233,7 +285,15 @@ const InterviewRoom = () => {
       }
     }
 
+    const isEditableTarget = (target: EventTarget | null) => {
+      const el = target as HTMLElement | null
+      if (!el) return false
+      return Boolean(el.closest('input, textarea, [contenteditable="true"]'))
+    }
+
     const onContextMenu = (e: Event) => {
+      if (!shouldEnforceProctoring()) return
+      if (isEditableTarget(e.target)) return
       e.preventDefault()
       proctorEventsRef.current = [
         ...proctorEventsRef.current,
@@ -243,6 +303,8 @@ const InterviewRoom = () => {
     }
 
     const onClipboard = (e: Event) => {
+      if (!shouldEnforceProctoring()) return
+      if (isEditableTarget(e.target)) return
       e.preventDefault()
       const evtType = (e as any)?.type || 'copy_paste'
       proctorEventsRef.current = [
@@ -252,21 +314,58 @@ const InterviewRoom = () => {
       toast.error('Copy/paste disabled during interview')
     }
 
+    const onSelectStart = (e: Event) => {
+      if (!shouldEnforceProctoring()) return
+      if (isEditableTarget(e.target)) return
+      e.preventDefault()
+    }
+
+    const onDragStart = (e: Event) => {
+      if (!shouldEnforceProctoring()) return
+      if (isEditableTarget(e.target)) return
+      e.preventDefault()
+    }
+
     document.addEventListener('fullscreenchange', onFullscreenChange)
     document.addEventListener('contextmenu', onContextMenu)
     document.addEventListener('copy', onClipboard)
     document.addEventListener('cut', onClipboard)
     document.addEventListener('paste', onClipboard)
+    document.addEventListener('selectstart', onSelectStart)
+    document.addEventListener('dragstart', onDragStart)
+
+    const WINDOW_BLUR_GRACE_MS = 1200
+    const WINDOW_BLUR_COOLDOWN_MS = 4000
 
     const onWindowBlur = () => {
+      windowBlurSinceRef.current = Date.now()
+    }
+
+    const onWindowFocus = () => {
+      const blurSince = windowBlurSinceRef.current
+      windowBlurSinceRef.current = 0
+      if (!blurSince) return
+
+      const now = Date.now()
+      const blurMs = now - blurSince
+      if (blurMs < WINDOW_BLUR_GRACE_MS) return
+      if (now - lastWindowBlurEventAtRef.current < WINDOW_BLUR_COOLDOWN_MS) return
+
+      lastWindowBlurEventAtRef.current = now
       proctorEventsRef.current = [
         ...proctorEventsRef.current,
-        { type: 'window_blur', timestamp: new Date() },
+        {
+          type: 'window_blur',
+          timestamp: new Date(),
+          metadata: { blur_ms: blurMs },
+        },
       ].slice(-50)
       toast.error('Focus lost - stay on the interview')
     }
 
     const onKeyDown = (e: KeyboardEvent) => {
+      if (!shouldEnforceProctoring()) return
+
       const key = (e.key || '').toLowerCase()
       const code = (e.code || '').toLowerCase()
 
@@ -322,8 +421,49 @@ const InterviewRoom = () => {
       toast.error('Prohibited keys detected')
     }
 
+    const extensionWatchdog = window.setInterval(() => {
+      if (!isProctoringActive) return
+
+      // Browser extensions cannot be reliably disabled from a web app.
+      // This is a best-effort signal-based detection for suspicious automation/tooling.
+      const hasWebDriver = Boolean((navigator as any).webdriver)
+      const hasKnownAutomationFlag = Boolean((window as any).__nightmare || (window as any).domAutomation)
+
+      if (!hasWebDriver && !hasKnownAutomationFlag) return
+
+      const now = Date.now()
+      if (now - lastExtensionEventAtRef.current < 15000) return
+      lastExtensionEventAtRef.current = now
+
+      proctorEventsRef.current = [
+        ...proctorEventsRef.current,
+        {
+          type: 'extension_detected',
+          timestamp: new Date(),
+          metadata: {
+            webdriver: hasWebDriver,
+            automation_flag: hasKnownAutomationFlag,
+          },
+        },
+      ].slice(-50)
+
+      toast.error('Suspicious browser tooling detected during fullscreen test mode')
+    }, 3000)
+
     window.addEventListener('blur', onWindowBlur)
+    window.addEventListener('focus', onWindowFocus)
     window.addEventListener('keydown', onKeyDown, { capture: true })
+
+    const fullscreenWatchdog = window.setInterval(() => {
+      if (!isProctoringActive) return
+      if (document.fullscreenElement) return
+
+      fullscreenRetryRef.current += 1
+
+      void document.documentElement.requestFullscreen().catch(() => {
+        // ignore; browser may require a user gesture
+      })
+    }, 2500)
 
     return () => {
       document.removeEventListener('fullscreenchange', onFullscreenChange)
@@ -331,10 +471,15 @@ const InterviewRoom = () => {
       document.removeEventListener('copy', onClipboard)
       document.removeEventListener('cut', onClipboard)
       document.removeEventListener('paste', onClipboard)
+      document.removeEventListener('selectstart', onSelectStart)
+      document.removeEventListener('dragstart', onDragStart)
       window.removeEventListener('blur', onWindowBlur)
+      window.removeEventListener('focus', onWindowFocus)
       window.removeEventListener('keydown', onKeyDown, { capture: true } as any)
+      window.clearInterval(fullscreenWatchdog)
+      window.clearInterval(extensionWatchdog)
     }
-  }, [interviewData?.data?.is_proctored])
+  }, [interviewData?.data?.is_proctored, isProctoringActive])
 
   // Background noise monitoring (best-effort, proctored only)
   useEffect(() => {
@@ -377,6 +522,7 @@ const InterviewRoom = () => {
       try {
         stream = await navigator.mediaDevices.getUserMedia({ audio: true })
         if (cancelled) return
+        setMicReady(true)
 
         audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)()
         const source = audioCtx.createMediaStreamSource(stream)
@@ -406,6 +552,7 @@ const InterviewRoom = () => {
         rafId = requestAnimationFrame(loop)
       } catch (err: any) {
         // Mic permission denied or not available; keep null and inform the user.
+        setMicReady(false)
         audioLevelRef.current = null
         const isDenied =
           err?.name === 'NotAllowedError' ||
@@ -421,9 +568,110 @@ const InterviewRoom = () => {
 
     return () => {
       cancelled = true
+      setMicReady(false)
       stop()
     }
   }, [isProctoringActive])
+
+  useEffect(() => {
+    micReadyRef.current = micReady
+  }, [micReady])
+
+  useEffect(() => {
+    if (!interviewData?.data?.is_proctored || !isProctoringActive) return
+
+    let cancelled = false
+
+    const getVideo = () => {
+      const wc: any = webcamRef.current
+      const video = wc?.video as HTMLVideoElement | undefined
+      if (!video) return null
+      if ((video.readyState ?? 0) < 2) return null
+      return video
+    }
+
+    const runPreflight = async () => {
+      setIsPreflightChecking(true)
+      setPreflightError(null)
+      setCameraReady(false)
+      setModelWarmedUp(false)
+
+      setCameraEnabled(true)
+      await requestFullscreenIfPossible()
+
+      const cameraStart = Date.now()
+      let video: HTMLVideoElement | null = null
+      while (!cancelled && Date.now() - cameraStart < 15000) {
+        video = getVideo()
+        if (video) break
+        await sleep(250)
+      }
+
+      if (cancelled) return
+      if (!video) {
+        setPreflightError('Camera is not ready. Please allow camera access and keep camera on.')
+        setIsPreflightChecking(false)
+        return
+      }
+      setCameraReady(true)
+
+      const micStart = Date.now()
+      while (!cancelled && Date.now() - micStart < 15000) {
+        if (micReadyRef.current) break
+        await sleep(250)
+      }
+
+      if (cancelled) return
+      if (!micReadyRef.current) {
+        setPreflightError('Microphone is not ready. Please allow microphone access to continue.')
+        setIsPreflightChecking(false)
+        return
+      }
+
+      let warmupSucceeded = false
+      const warmupStart = Date.now()
+      while (!cancelled && Date.now() - warmupStart < 9000) {
+        try {
+          const warmVideo = getVideo()
+          if (!warmVideo) {
+            await sleep(250)
+            continue
+          }
+          const warmupResult = await Promise.race([
+            detectPeopleAndPhonesFromElement(warmVideo),
+            sleep(2000).then(() => null),
+          ])
+
+          if (warmupResult === null) {
+            await sleep(250)
+            continue
+          }
+
+          warmupSucceeded = true
+          break
+        } catch {
+          await sleep(400)
+        }
+      }
+
+      if (cancelled) return
+      if (!warmupSucceeded) {
+        setPreflightError('Detector warm-up timed out. Click Retry to re-initialize proctoring quickly.')
+        setIsPreflightChecking(false)
+        return
+      }
+
+      setModelWarmedUp(true)
+      setPreflightError(null)
+      setIsPreflightChecking(false)
+    }
+
+    void runPreflight()
+
+    return () => {
+      cancelled = true
+    }
+  }, [interviewData?.data?.is_proctored, isProctoringActive, preflightAttempt])
 
   // Proctoring updates
   useEffect(() => {
@@ -456,7 +704,23 @@ const InterviewRoom = () => {
         if (!detectionInFlightRef.current) {
           detectionInFlightRef.current = true
           try {
-            const { phoneCount, personCount } = await detectPeopleAndPhonesFromElement(video)
+            const { faceCount, personCount, phoneCount, boxes } = await detectPeopleAndPhonesFromElement(video)
+            setLiveDetectionBoxes(boxes)
+            setLiveFrameSize({
+              width: Math.max(1, video.videoWidth || 480),
+              height: Math.max(1, video.videoHeight || 270),
+            })
+            setLiveDetectionCounts({
+              faces: faceCount,
+              people: personCount,
+              phones: phoneCount,
+            })
+
+            const personBoxes = boxes.filter((b) => b.label === 'person')
+            const phoneBoxes = boxes.filter((b) => b.label === 'cell phone')
+            const maxPersonConfidence = personBoxes.reduce((m, b) => Math.max(m, b.score || 0), 0)
+            const maxPhoneConfidence = phoneBoxes.reduce((m, b) => Math.max(m, b.score || 0), 0)
+            const effectivePeopleCount = Math.max(faceCount, personCount)
 
             if (phoneCount > 0) {
               // Make the UI feel immediate by showing a local warning instantly.
@@ -472,11 +736,28 @@ const InterviewRoom = () => {
 
               proctorEventsRef.current = [
                 ...proctorEventsRef.current,
-                { type: 'phone_detected', timestamp: new Date(), metadata: { phone_count: phoneCount } },
+                {
+                  type: 'phone_detected',
+                  timestamp: new Date(),
+                  metadata: {
+                    phone_count: phoneCount,
+                    confidence: Number(maxPhoneConfidence.toFixed(3)),
+                  },
+                },
               ].slice(-50)
             }
 
-            if (personCount > 1) {
+            if (faceCount === 0) {
+              const now = Date.now()
+              if (now - lastLookAwayEventAtRef.current > 8000) {
+                lastLookAwayEventAtRef.current = now
+                setLookAwayCount((prev) => prev + 1)
+              }
+              proctorEventsRef.current = [
+                ...proctorEventsRef.current,
+                { type: 'no_face_detected', timestamp: new Date(), metadata: { face_count: faceCount } },
+              ].slice(-50)
+            } else if (effectivePeopleCount > 1) {
               const now = Date.now()
               if (now - lastMultiplePeopleEventAtRef.current > 8000) {
                 lastMultiplePeopleEventAtRef.current = now
@@ -484,11 +765,21 @@ const InterviewRoom = () => {
               }
               proctorEventsRef.current = [
                 ...proctorEventsRef.current,
-                { type: 'multiple_persons', timestamp: new Date(), metadata: { person_count: personCount } },
+                {
+                  type: 'multiple_faces',
+                  timestamp: new Date(),
+                  metadata: {
+                    face_count: faceCount,
+                    person_count: personCount,
+                    confidence: Number(maxPersonConfidence.toFixed(3)),
+                  },
+                },
               ].slice(-50)
             }
           } catch {
             // Ignore detection failures
+            setLiveDetectionBoxes([])
+            setLiveDetectionCounts({ faces: 0, people: 0, phones: 0 })
           } finally {
             detectionInFlightRef.current = false
           }
@@ -577,6 +868,14 @@ const InterviewRoom = () => {
     }
   }, [interviewId, cameraEnabled, tabSwitchCount, isProctoringActive])
 
+  useEffect(() => {
+    if (!cameraEnabled) {
+      setLiveDetectionBoxes([])
+      setCameraReady(false)
+      setModelWarmedUp(false)
+    }
+  }, [cameraEnabled])
+
   const requestFullscreenIfPossible = async () => {
     if (!isProctoringActive) return
     if (document.fullscreenElement) return
@@ -639,6 +938,18 @@ const InterviewRoom = () => {
   }, [reviewAudioUrl])
 
   const handleSubmitAnswer = (audioFile?: File) => {
+    if (!isStrictProctorReady) {
+      toast.error('Proctoring setup is not ready. Wait for fullscreen, camera, microphone, and model warm-up.')
+      void requestFullscreenIfPossible()
+      return
+    }
+
+    if (isProctored && !document.fullscreenElement) {
+      toast.error('Enter fullscreen mode to continue this proctored interview')
+      void requestFullscreenIfPossible()
+      return
+    }
+
     if (!textAnswer.trim() && !audioFile) {
       toast.error('Please provide an answer')
       return
@@ -656,6 +967,11 @@ const InterviewRoom = () => {
   }
 
   const handleVoiceResponse = () => {
+    if (!isStrictProctorReady) {
+      toast.error('Wait until proctoring setup is complete before recording')
+      return
+    }
+
     if (isReviewingVoiceAnswer) return
     if (isRecording) {
       stopRecording()
@@ -751,6 +1067,7 @@ const InterviewRoom = () => {
   const currentQuestion = getCurrentQuestion()
   const progress = getProgressPercentage()
   const isProctored = interviewData?.data?.is_proctored
+  const isStrictProctorReady = !isProctored || (isFullscreenActive && cameraReady && micReady && modelWarmedUp)
   const questionsAnswered = interviewData?.data?.questions_answered ?? 0
   const totalQuestions = interviewData?.data?.total_questions ?? 0
 
@@ -1014,9 +1331,27 @@ const InterviewRoom = () => {
                     <textarea
                       value={textAnswer}
                       onChange={(e) => setTextAnswer(e.target.value)}
+                      disabled={!isStrictProctorReady}
                       placeholder="Type your answer here..."
                       className="w-full h-32 bg-gray-700 border border-gray-600 rounded-lg p-3 text-white placeholder-gray-400 resize-none focus:ring-2 focus:ring-primary-500 focus:border-transparent"
                     />
+                    {!isStrictProctorReady && isProctored && (
+                      <div className="rounded-lg border border-yellow-600/40 bg-yellow-900/30 px-3 py-2 text-sm text-yellow-200">
+                        {isPreflightChecking
+                          ? 'Preparing secure exam environment. Please wait for fullscreen, camera, microphone, and model warm-up.'
+                          : 'Exam is locked until fullscreen, camera, microphone, and model warm-up are ready.'}
+                        {preflightError && (
+                          <div className="mt-2">
+                            <button
+                              onClick={() => setPreflightAttempt((v) => v + 1)}
+                              className="rounded bg-yellow-700 hover:bg-yellow-600 px-2 py-1 text-xs text-yellow-100"
+                            >
+                              Retry setup
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    )}
                     {isAgentThinking ? (
                       <div className="flex items-center gap-3 bg-indigo-900 border border-indigo-700 rounded-lg px-4 py-3">
                         <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-indigo-300 flex-shrink-0"></div>
@@ -1027,7 +1362,7 @@ const InterviewRoom = () => {
                     ) : (
                       <button
                         onClick={() => handleSubmitAnswer()}
-                        disabled={!textAnswer.trim() || submitAnswerMutation.isPending}
+                        disabled={!isStrictProctorReady || !textAnswer.trim() || submitAnswerMutation.isPending}
                         className="btn-primary disabled:opacity-50 disabled:cursor-not-allowed"
                       >
                         <Send className="h-4 w-4 mr-2" />
@@ -1077,6 +1412,7 @@ const InterviewRoom = () => {
                         <div className="flex items-center justify-center">
                           <button
                             onClick={handleVoiceResponse}
+                            disabled={!isStrictProctorReady}
                             className={`flex items-center px-6 py-3 rounded-full text-lg font-medium transition-colors ${
                               isRecording
                                 ? 'bg-red-600 hover:bg-red-700 animate-pulse'
@@ -1137,9 +1473,14 @@ const InterviewRoom = () => {
                           )
                         }
                       } else {
+                        if (isProctored) {
+                          toast.error('Camera cannot be turned off during a proctored interview')
+                          return
+                        }
                         setCameraEnabled(false)
                       }
                     }}
+                    disabled={isProctored && cameraEnabled}
                     className={`p-2 rounded-lg ${
                       cameraEnabled ? 'bg-green-600' : 'bg-gray-600'
                     }`}
@@ -1148,21 +1489,87 @@ const InterviewRoom = () => {
                   </button>
                 </div>
                 {cameraEnabled ? (
-                  <Webcam
-                    ref={webcamRef}
-                    audio={false}
-                    screenshotFormat="image/jpeg"
-                    screenshotQuality={0.7}
-                    videoConstraints={{
-                      width: 480,
-                      height: 270,
-                      facingMode: 'user',
-                    }}
-                    className="w-full rounded-lg"
-                  />
+                  <div className="relative aspect-video w-full overflow-hidden rounded-lg bg-black">
+                    <Webcam
+                      ref={webcamRef}
+                      audio={false}
+                      screenshotFormat="image/jpeg"
+                      screenshotQuality={0.7}
+                      videoConstraints={{
+                        width: 480,
+                        height: 270,
+                        facingMode: 'user',
+                      }}
+                      className="absolute inset-0 h-full w-full object-cover"
+                    />
+
+                    {isProctored && (
+                      <div className="absolute inset-0 z-20 pointer-events-none overflow-hidden rounded-lg">
+                        <div className="absolute left-2 top-2 rounded-md bg-black/70 px-2 py-1 text-[10px] font-medium text-white backdrop-blur-sm">
+                          Live detections: {liveDetectionBoxes.length}
+                        </div>
+                        {liveDetectionBoxes.map((box, index) => {
+                          const [x, y, w, h] = box.bbox
+                          const frameW = Math.max(1, liveFrameSize.width)
+                          const frameH = Math.max(1, liveFrameSize.height)
+                          const left = `${(x / frameW) * 100}%`
+                          const top = `${(y / frameH) * 100}%`
+                          const width = `${(w / frameW) * 100}%`
+                          const height = `${(h / frameH) * 100}%`
+                          const color = box.label === 'cell phone' ? 'rgb(248 113 113)' : box.label === 'person' ? 'rgb(251 191 36)' : 'rgb(74 222 128)'
+                          const confidencePct = Math.max(0, Math.min(100, Math.round((box.score || 0) * 100)))
+
+                          return (
+                            <div
+                              key={`${box.label}-${index}-${x}-${y}`}
+                              className={`absolute border-2 ${box.label === 'face' ? 'border-dashed' : 'border-solid'}`}
+                              style={{ left, top, width, height, borderColor: color }}
+                            >
+                              <div
+                                className="absolute -top-6 left-0 text-[10px] px-1.5 py-0.5 rounded text-white font-semibold whitespace-nowrap"
+                                style={{ backgroundColor: color }}
+                              >
+                                {box.label} {confidencePct}%
+                              </div>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    )}
+                  </div>
                 ) : (
                   <div className="bg-gray-700 h-32 rounded-lg flex items-center justify-center">
                     <p className="text-sm text-gray-400">Camera disabled</p>
+                  </div>
+                )}
+
+                {isProctored && cameraEnabled && (
+                  <div className="mt-2 space-y-1">
+                    <p className="text-[11px] text-gray-400">
+                      Live detection boxes show class + confidence percentage for person and mobile phone.
+                    </p>
+                    <p className="text-[11px] text-gray-300">
+                      Faces: <span className="font-semibold">{liveDetectionCounts.faces}</span> | People: <span className="font-semibold">{liveDetectionCounts.people}</span> | Phones: <span className="font-semibold">{liveDetectionCounts.phones}</span>
+                    </p>
+                  </div>
+                )}
+
+                {isProctored && (
+                  <div className="mt-2 rounded-lg border border-gray-700 bg-gray-900/60 p-2 text-[11px]">
+                    <p className="font-medium text-gray-200 mb-1">Proctoring readiness</p>
+                    <p className={isFullscreenActive ? 'text-green-300' : 'text-yellow-300'}>Fullscreen: {isFullscreenActive ? 'Ready' : 'Required'}</p>
+                    <p className={cameraReady ? 'text-green-300' : 'text-yellow-300'}>Camera: {cameraReady ? 'Ready' : 'Initializing'}</p>
+                    <p className={micReady ? 'text-green-300' : 'text-yellow-300'}>Microphone: {micReady ? 'Ready' : 'Required'}</p>
+                    <p className={modelWarmedUp ? 'text-green-300' : 'text-yellow-300'}>Model warm-up: {modelWarmedUp ? 'Ready' : 'Warming up'}</p>
+                    {preflightError && <p className="text-red-300 mt-1">{preflightError}</p>}
+                    {preflightError && (
+                      <button
+                        onClick={() => setPreflightAttempt((v) => v + 1)}
+                        className="mt-2 rounded bg-yellow-700 hover:bg-yellow-600 px-2 py-1 text-[11px] text-yellow-100"
+                      >
+                        Retry warm-up
+                      </button>
+                    )}
                   </div>
                 )}
               </div>
@@ -1265,7 +1672,11 @@ const InterviewRoom = () => {
               Stay
             </button>
             <button
-              onClick={() => navigate('/student')}
+              onClick={() =>
+                navigate('/student/performance', {
+                  state: { interviewId: parsedInterviewId, exitedInterview: true },
+                })
+              }
               className="px-4 py-2 rounded-lg bg-red-600 hover:bg-red-700 text-white text-sm font-medium"
             >
               Exit anyway

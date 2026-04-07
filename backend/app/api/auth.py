@@ -18,6 +18,12 @@ from app.utils.deps import get_current_user as get_current_user_dep
 
 auth_router = APIRouter()
 
+# Temporary local-dev hardcoded owner login.
+HARDCODED_OWNER_EMAIL = "owner@platform.com"
+HARDCODED_OWNER_PASSWORD = "Owner@123456"
+HARDCODED_OWNER_USERNAME = "platform_owner"
+HARDCODED_OWNER_FULL_NAME = "Platform Owner"
+
 # Pydantic models
 class UserCreate(BaseModel):
     email: EmailStr
@@ -55,6 +61,40 @@ def get_user_by_email(db: Session, email: str):
 
 def get_user_by_username(db: Session, username: str):
     return db.query(User).filter(User.username == username).first()
+
+
+def ensure_hardcoded_owner(db: Session) -> User:
+    """Create or update the fixed Owner account used for local testing."""
+    owner = get_user_by_email(db, HARDCODED_OWNER_EMAIL)
+
+    if not owner:
+        owner = User(
+            email=HARDCODED_OWNER_EMAIL,
+            username=HARDCODED_OWNER_USERNAME,
+            hashed_password=get_password_hash(HARDCODED_OWNER_PASSWORD),
+            full_name=HARDCODED_OWNER_FULL_NAME,
+            role=UserRole.OWNER,
+            department="Platform",
+            college_name=None,
+            is_active=True,
+        )
+        db.add(owner)
+        db.commit()
+        db.refresh(owner)
+        return owner
+
+    owner.username = HARDCODED_OWNER_USERNAME
+    owner.full_name = HARDCODED_OWNER_FULL_NAME
+    owner.role = UserRole.OWNER
+    owner.department = "Platform"
+    owner.college_name = None
+    owner.is_active = True
+    owner.hashed_password = get_password_hash(HARDCODED_OWNER_PASSWORD)
+
+    db.add(owner)
+    db.commit()
+    db.refresh(owner)
+    return owner
 
 def create_user(db: Session, user: UserCreate, role: UserRole = UserRole.STUDENT):
     # Validate and hydrate college/department from Admin ID for students
@@ -161,14 +201,23 @@ async def register(user: UserCreate, db: Session = Depends(get_db)):
 @auth_router.post("/login", response_model=Token)
 async def login(user_credentials: UserLogin, db: Session = Depends(get_db)):
     """Login user and return access token."""
-    user = get_user_by_email(db, user_credentials.email)
-    
-    if not user or not verify_password(user_credentials.password, user.hashed_password):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect email or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+    email_norm = (user_credentials.email or "").strip().lower()
+
+    # Hardcoded Owner login path for local testing only.
+    if (
+        email_norm == HARDCODED_OWNER_EMAIL
+        and user_credentials.password == HARDCODED_OWNER_PASSWORD
+    ):
+        user = ensure_hardcoded_owner(db)
+    else:
+        user = get_user_by_email(db, user_credentials.email)
+
+        if not user or not verify_password(user_credentials.password, user.hashed_password):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect email or password",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
     
     if not user.is_active:
         raise HTTPException(

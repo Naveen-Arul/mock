@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Users, Calendar, BarChart3, Shield,
   TrendingUp, AlertTriangle, LogOut, Activity,
@@ -10,6 +10,7 @@ import {
 } from 'lucide-react'
 import { useAuthStore } from '../../stores/authStore'
 import { adminApi } from '../../utils/api'
+import { subscribeMalpracticeUpdates } from '../../utils/realtime'
 
 /* ══════════════════════════════════════════
    HOOKS
@@ -100,22 +101,37 @@ const avatarGradients = [
 ══════════════════════════════════════════ */
 export default function AdminDashboard() {
   const { user, logout } = useAuthStore()
+  const queryClient = useQueryClient()
+
+  useEffect(() => {
+    const unsubscribe = subscribeMalpracticeUpdates(() => {
+      queryClient.invalidateQueries({ queryKey: ['admin-dashboard'] })
+      queryClient.invalidateQueries({ queryKey: ['admin-malpractice'] })
+      queryClient.invalidateQueries({ queryKey: ['admin-students'] })
+    })
+
+    return unsubscribe
+  }, [queryClient])
 
   const { data: dashboardData } = useQuery({
     queryKey: ['admin-dashboard'],
     queryFn: adminApi.getDashboardAnalytics,
+    refetchInterval: 10000,
   })
   const { data: studentsData, isLoading: studentsLoading } = useQuery({
     queryKey: ['admin-students'],
     queryFn: adminApi.getMyStudents,
+    refetchInterval: 10000,
   })
   const { data: scheduledData, isLoading: scheduledLoading } = useQuery({
     queryKey: ['admin-scheduled'],
     queryFn: adminApi.getScheduledInterviews,
+    refetchInterval: 10000,
   })
   const { data: malpracticeData } = useQuery({
     queryKey: ['admin-malpractice'],
     queryFn: adminApi.getMalpracticeReports,
+    refetchInterval: 10000,
   })
 
   const d           = dashboardData?.data || {}

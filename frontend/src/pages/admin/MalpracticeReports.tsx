@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import Footer from '../../components/Footer';
 import {
@@ -19,6 +19,7 @@ import {
 import { Link } from "react-router-dom";
 import { adminApi, getApiErrorMessage } from "../../utils/api";
 import { toast } from "react-hot-toast";
+import { subscribeMalpracticeUpdates } from "../../utils/realtime";
 
 type ViolationBreakdownItem = {
   violation_type: string;
@@ -36,10 +37,25 @@ type ConsolidatedReport = {
   overall_score: number | null;
   total_violations: number;
   overall_severity: string;
+  security_rating: string;
+  weighted_risk_score: number;
   violation_breakdown: ViolationBreakdownItem[];
   first_detected_at: string;
   status: string;
   actions_taken: string | null;
+};
+
+const getSecurityRatingColor = (rating: string) => {
+  switch (rating) {
+    case "Normal":
+      return "text-green-700 bg-green-100 border-green-300";
+    case "Suspicious":
+      return "text-yellow-800 bg-yellow-100 border-yellow-300";
+    case "High Risk":
+      return "text-red-800 bg-red-100 border-red-300";
+    default:
+      return "text-gray-700 bg-gray-100 border-gray-300";
+  }
 };
 
 const SEVERITY_ORDER: Record<string, number> = { low: 0, medium: 1, high: 2, critical: 3 };
@@ -109,9 +125,19 @@ const MalpracticeReports = () => {
 
   const queryClient = useQueryClient();
 
+  useEffect(() => {
+    const unsubscribe = subscribeMalpracticeUpdates(() => {
+      queryClient.invalidateQueries({ queryKey: ["admin-malpractice-reports"] });
+      queryClient.invalidateQueries({ queryKey: ["admin-dashboard"] });
+    });
+
+    return unsubscribe;
+  }, [queryClient]);
+
   const { data: reportsData, isLoading } = useQuery({
     queryKey: ["admin-malpractice-reports"],
     queryFn: () => adminApi.getMalpracticeReports({}),
+    refetchInterval: 10000,
   });
 
   const reviewMutation = useMutation({
@@ -266,6 +292,9 @@ const MalpracticeReports = () => {
                             <span className={`px-2 py-0.5 rounded-full text-xs font-medium border ${getSeverityColor(report.overall_severity)}`}>
                               {report.overall_severity.toUpperCase()} severity
                             </span>
+                            <span className={`px-2 py-0.5 rounded-full text-xs font-medium border ${getSecurityRatingColor(report.security_rating)}`}>
+                              {report.security_rating}
+                            </span>
                             <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${getStatusColor(report.status)}`}>
                               {report.status}
                             </span>
@@ -297,6 +326,10 @@ const MalpracticeReports = () => {
                               <div className={`text-xl font-bold ${getScoreColor(report.overall_score)}`}>
                                 {report.overall_score !== null ? `${Math.round(report.overall_score)}% (${scoreGrade})` : "—"}
                               </div>
+                            </div>
+                            <div>
+                              <div className="text-xs text-gray-500 mb-0.5">Weighted Risk</div>
+                              <div className="text-xl font-bold text-purple-700">{report.weighted_risk_score}</div>
                             </div>
                           </div>
                         </div>
@@ -434,7 +467,7 @@ const MalpracticeReports = () => {
               </div>
 
               {/* Score & severity */}
-              <div className="grid grid-cols-3 gap-3 mb-5">
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-5">
                 <div className="text-center bg-gray-50 rounded-lg p-3">
                   <div className="text-xs text-gray-500 mb-1">Interview Score</div>
                   <div className={`text-2xl font-bold ${getScoreColor(selectedReport.overall_score)}`}>
@@ -451,6 +484,13 @@ const MalpracticeReports = () => {
                   <span className={`inline-block mt-1 px-3 py-1 rounded-full text-xs font-medium border ${getSeverityColor(selectedReport.overall_severity)}`}>
                     {selectedReport.overall_severity.toUpperCase()}
                   </span>
+                </div>
+                <div className="text-center bg-gray-50 rounded-lg p-3">
+                  <div className="text-xs text-gray-500 mb-1">Security Rating</div>
+                  <span className={`inline-block mt-1 px-3 py-1 rounded-full text-xs font-medium border ${getSecurityRatingColor(selectedReport.security_rating)}`}>
+                    {selectedReport.security_rating}
+                  </span>
+                  <div className="text-xs text-gray-500 mt-2">Weighted risk: {selectedReport.weighted_risk_score}</div>
                 </div>
               </div>
 

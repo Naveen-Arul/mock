@@ -303,15 +303,6 @@ const LoginPage = () => {
             </Link>
           </p>
 
-          {/* Demo credentials */}
-          <div className="mt-8 rounded-2xl border border-dashed border-gray-200 bg-gray-50 px-5 py-4">
-            <p className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2">Demo Accounts</p>
-            <div className="space-y-1 text-xs text-gray-500">
-              <p><span className="font-medium text-gray-600">Student:</span> student@demo.com / password123</p>
-              <p><span className="font-medium text-gray-600">Admin:</span> admin@demo.com / admin123</p>
-              <p><span className="font-medium text-gray-600">Super Admin:</span> superadmin@demo.com / superadmin123</p>
-            </div>
-          </div>
 
           {/* Mobile back link */}
           <p className="mt-6 text-center text-xs text-gray-400 lg:hidden">
